@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-插接声音特征分析（自动定位事件 + 频域/时频特征）
+增强版：音频 + 加速度插接分析（增加加速度时/频域高级特征）
 - 递归扫描 recordings/ 下的 .wav（含 recordings/recordings 嵌套目录）
 - 预处理：单声道、归一化、300 Hz 高通
 - 事件检测：RMS + 谱通量 z-score 联合打分找峰值
 - 特征提取：事件窗 vs 背景窗（FFT/谱统计/带通能量/MFCC/时域）
-- 输出：每文件图像（波形+STFT），汇总 CSV（事件/背景/差值特征）
+- 加速度分析：匹配时间戳，Welch PSD，统计效应量，复合评分
+- 输出：每文件图像（波形+STFT），汇总 CSV（事件/背景/差值特征 + 加速度特征）
 
-依赖：numpy scipy librosa soundfile matplotlib pandas
-安装：pip install numpy scipy librosa soundfile matplotlib pandas
+依赖：numpy scipy librosa soundfile matplotlib pandas python-docx
+安装：pip install numpy scipy librosa soundfile matplotlib pandas python-docx
 """
 
 import os
 import glob
 import math
 from dataclasses import dataclass
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
 import librosa
 import librosa.display
 import soundfile as sf
-from scipy.signal import butter, sosfiltfilt
+from scipy.signal import butter, sosfiltfilt, welch
+from scipy import stats
 import matplotlib.pyplot as plt
 
 # --------------------
@@ -39,6 +42,16 @@ BG_SEC = 0.5                          # 背景窗长度（从事件前取）
 MIN_EVENT_GAP_SEC = 0.2               # 峰间最小距离（帧）
 PEAK_ZSCORE_TH = 3.5                  # 峰值 z-score 阈值
 FIG_DPI = 140
+
+# 加速度分析参数
+ACC_FREQ_BANDS = [(0, 5), (5, 10), (10, 20), (20, 50)]  # 加速度频带分析
+W_COEF = {                            # 复合评分权重
+    'diff_acc_mag_rms': 0.30,
+    'diff_acc_jerk_rms': 0.20,
+    'cohen_d_mag': 0.25,
+    'cohen_d_jerk': 0.15,
+    'diff_rms_dbfs': 0.10
+}
 
 # 带通频带（用于能量比例）
 BANDS = [(300, 1000), (1000, 3000), (3000, 8000)]
@@ -56,6 +69,181 @@ def list_wavs() -> list:
         files += glob.glob(os.path.join(d, "**", "*.wav"), recursive=True)
         files += glob.glob(os.path.join(d, "**", "*.WAV"), recursive=True)
     return sorted(files)
+
+def find_matching_accel_csv(wav_path: str) -> Optional[str]:
+    """Find corresponding acceleration CSV file based on timestamp in filename"""
+    wav_base = os.path.basename(wav_path)
+    # Extract timestamp from filename like audio_20250911_143152.wav
+    if "audio_" in wav_base:
+        timestamp_part = wav_base.replace("audio_", "").replace(".wav", "").replace(".WAV", "")
+        # Look for accel_data_[timestamp].csv in root directory
+        accel_pattern = f"accel_data_{timestamp_part}.csv"
+        accel_path = os.path.join(".", accel_pattern)
+        if os.path.exists(accel_path):
+            return accel_path
+    return None
+
+def load_accel_data(csv_path: str) -> Optional[pd.DataFrame]:
+    """Load and preprocess acceleration data"""
+    try:
+        df = pd.read_csv(csv_path)
+        # Parse timestamp if it's a string
+        if 'timestamp' in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'])
+        
+        # Calculate magnitude and jerk
+        if all(col in df.columns for col in ['accel_x', 'accel_y', 'accel_z']):
+            df['acc_mag'] = np.sqrt(df['accel_x']**2 + df['accel_y']**2 + df['accel_z']**2)
+            # Jerk (rate of change of acceleration)
+            df['acc_jerk'] = np.sqrt(
+                np.gradient(df['accel_x'])**2 + 
+                np.gradient(df['accel_y'])**2 + 
+                np.gradient(df['accel_z'])**2
+            )
+        return df
+    except Exception as e:
+        print(f"Error loading acceleration data {csv_path}: {e}")
+        return None
+
+def extract_accel_segment(df: pd.DataFrame, start_time: float, duration: float) -> Optional[pd.DataFrame]:
+    """Extract acceleration data segment based on time offset from start"""
+    if df is None or 'timestamp' not in df.columns:
+        return None
+    
+    # Convert to relative time from first timestamp
+    start_timestamp = df['timestamp'].iloc[0]
+    df_rel = df.copy()
+    df_rel['rel_time'] = (df_rel['timestamp'] - start_timestamp).dt.total_seconds()
+    
+    # Extract segment
+    mask = (df_rel['rel_time'] >= start_time) & (df_rel['rel_time'] <= start_time + duration)
+    segment = df_rel[mask].copy()
+    
+    return segment if len(segment) > 0 else None
+
+def compute_accel_features(accel_df: pd.DataFrame) -> Dict[str, float]:
+    """Compute acceleration features for a segment"""
+    if accel_df is None or len(accel_df) == 0:
+        return {}
+    
+    features = {}
+    
+    # Basic statistics for magnitude
+    if 'acc_mag' in accel_df.columns:
+        mag = accel_df['acc_mag'].values
+        features.update({
+            'acc_mag_mean': float(np.mean(mag)),
+            'acc_mag_std': float(np.std(mag)),
+            'acc_mag_rms': float(np.sqrt(np.mean(mag**2))),
+            'acc_mag_peak': float(np.max(np.abs(mag))),
+            'acc_mag_range': float(np.ptp(mag))
+        })
+        
+        # PSD analysis using Welch method
+        if len(mag) > 4:  # Need minimum samples for PSD
+            try:
+                # Estimate sampling rate from timestamps
+                if len(accel_df) > 1:
+                    dt = (accel_df['timestamp'].iloc[-1] - accel_df['timestamp'].iloc[0]).total_seconds() / (len(accel_df) - 1)
+                    fs = 1.0 / dt if dt > 0 else 100.0  # fallback to 100 Hz
+                else:
+                    fs = 100.0
+                
+                f, psd = welch(mag, fs=fs, nperseg=min(len(mag), 16))
+                
+                # Band energy ratios
+                for band_idx, (f_low, f_high) in enumerate(ACC_FREQ_BANDS):
+                    band_mask = (f >= f_low) & (f < f_high)
+                    if np.any(band_mask):
+                        band_power = np.sum(psd[band_mask])
+                        total_power = np.sum(psd) + 1e-12
+                        features[f'acc_psd_band_{f_low}-{f_high}_ratio'] = float(band_power / total_power)
+                
+                # Peak frequency
+                if len(psd) > 0:
+                    peak_idx = np.argmax(psd)
+                    features['acc_peak_freq'] = float(f[peak_idx]) if peak_idx < len(f) else 0.0
+                    
+            except Exception as e:
+                print(f"Warning: PSD analysis failed: {e}")
+    
+    # Jerk features
+    if 'acc_jerk' in accel_df.columns:
+        jerk = accel_df['acc_jerk'].values
+        features.update({
+            'acc_jerk_mean': float(np.mean(jerk)),
+            'acc_jerk_std': float(np.std(jerk)),
+            'acc_jerk_rms': float(np.sqrt(np.mean(jerk**2))),
+            'acc_jerk_peak': float(np.max(np.abs(jerk)))
+        })
+    
+    return features
+
+def cohen_d(group1: np.ndarray, group2: np.ndarray) -> float:
+    """Calculate Cohen's d effect size"""
+    if len(group1) == 0 or len(group2) == 0:
+        return 0.0
+    
+    n1, n2 = len(group1), len(group2)
+    if n1 == 1 and n2 == 1:
+        return 0.0
+    
+    # Calculate pooled standard deviation
+    s1, s2 = np.std(group1, ddof=1), np.std(group2, ddof=1)
+    pooled_std = np.sqrt(((n1 - 1) * s1**2 + (n2 - 1) * s2**2) / (n1 + n2 - 2))
+    
+    if pooled_std == 0:
+        return 0.0
+    
+    return (np.mean(group1) - np.mean(group2)) / pooled_std
+
+def compute_effect_sizes(ev_accel: pd.DataFrame, bg_accel: pd.DataFrame) -> Dict[str, float]:
+    """Compute statistical effect sizes between event and background acceleration"""
+    effects = {}
+    
+    if ev_accel is None or bg_accel is None or len(ev_accel) == 0 or len(bg_accel) == 0:
+        return effects
+    
+    # Cohen's d for magnitude and jerk
+    if 'acc_mag' in ev_accel.columns and 'acc_mag' in bg_accel.columns:
+        effects['cohen_d_mag'] = cohen_d(ev_accel['acc_mag'].values, bg_accel['acc_mag'].values)
+        
+        # t-test p-value
+        try:
+            _, p_val = stats.ttest_ind(ev_accel['acc_mag'].values, bg_accel['acc_mag'].values)
+            effects['p_ttest_mag'] = float(p_val)
+        except:
+            effects['p_ttest_mag'] = 1.0
+    
+    if 'acc_jerk' in ev_accel.columns and 'acc_jerk' in bg_accel.columns:
+        effects['cohen_d_jerk'] = cohen_d(ev_accel['acc_jerk'].values, bg_accel['acc_jerk'].values)
+        
+        try:
+            _, p_val = stats.ttest_ind(ev_accel['acc_jerk'].values, bg_accel['acc_jerk'].values)
+            effects['p_ttest_jerk'] = float(p_val)
+        except:
+            effects['p_ttest_jerk'] = 1.0
+    
+    return effects
+
+def compute_accel_composite_score(features: Dict[str, float]) -> float:
+    """Compute composite acceleration event score"""
+    score = 0.0
+    total_weight = 0.0
+    
+    for feature, weight in W_COEF.items():
+        if feature in features:
+            # Normalize features (absolute value for effect sizes)
+            val = features[feature]
+            if feature.startswith('cohen_d'):
+                val = abs(val)
+            elif feature.startswith('diff_'):
+                val = abs(val)
+            
+            score += weight * val
+            total_weight += weight
+    
+    return score / total_weight if total_weight > 0 else 0.0
 
 def read_wav_mono(path: str, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int]:
     y, sr = librosa.load(path, sr=target_sr, mono=True)
@@ -234,7 +422,7 @@ def main():
             y_event = y[ev_a:ev_b]
             y_bg = y[bg_a:bg_b]
 
-            # 特征
+            # 音频特征
             ev_feat = compute_block_features(y_event, sr)
             bg_feat = compute_block_features(y_bg, sr)
 
@@ -246,6 +434,47 @@ def main():
             for (lo,hi) in BANDS:
                 key = f"band_{lo}-{hi}_ratio"
                 diff_feat[f"diff_{key}"] = ev_feat.get(key,0.0) - bg_feat.get(key,0.0)
+
+            # 加速度分析
+            accel_csv = find_matching_accel_csv(path)
+            accel_features = {}
+            accel_diff_features = {}
+            effect_features = {}
+            
+            if accel_csv:
+                accel_df = load_accel_data(accel_csv)
+                if accel_df is not None:
+                    # Extract acceleration segments aligned with audio
+                    event_time = event_sample / sr
+                    ev_accel = extract_accel_segment(accel_df, event_time - EVENT_PRE_SEC, 
+                                                   EVENT_PRE_SEC + EVENT_POST_SEC)
+                    bg_accel = extract_accel_segment(accel_df, event_time - EVENT_PRE_SEC - BG_SEC, BG_SEC)
+                    
+                    # Compute acceleration features
+                    if ev_accel is not None:
+                        ev_accel_feat = compute_accel_features(ev_accel)
+                        accel_features.update({f"ev_{k}": v for k, v in ev_accel_feat.items()})
+                    
+                    if bg_accel is not None:
+                        bg_accel_feat = compute_accel_features(bg_accel)
+                        accel_features.update({f"bg_{k}": v for k, v in bg_accel_feat.items()})
+                    
+                    # Compute differences
+                    if ev_accel is not None and bg_accel is not None:
+                        ev_accel_feat = compute_accel_features(ev_accel)
+                        bg_accel_feat = compute_accel_features(bg_accel)
+                        
+                        for k in ["acc_mag_mean", "acc_mag_std", "acc_mag_rms", "acc_mag_peak", 
+                                "acc_jerk_mean", "acc_jerk_std", "acc_jerk_rms", "acc_jerk_peak"]:
+                            if k in ev_accel_feat and k in bg_accel_feat:
+                                accel_diff_features[f"diff_{k}"] = ev_accel_feat[k] - bg_accel_feat[k]
+                        
+                        # Effect sizes
+                        effect_features = compute_effect_sizes(ev_accel, bg_accel)
+                        
+                        # Add composite score
+                        all_features = {**accel_diff_features, **effect_features, **diff_feat}
+                        accel_features['accel_event_score'] = compute_accel_composite_score(all_features)
 
             # 保存图
             rel = os.path.relpath(path)
@@ -260,6 +489,9 @@ def main():
                 **{f"ev_{k}": v for k,v in ev_feat.items()},
                 **{f"bg_{k}": v for k,v in bg_feat.items()},
                 **diff_feat,
+                **accel_features,
+                **accel_diff_features,
+                **effect_features,
             }
             rows.append(row)
             print(f"完成: {rel}")
@@ -269,8 +501,94 @@ def main():
     df = pd.DataFrame(rows)
     csv_path = os.path.join(OUTPUT_DIR, "features.csv")
     df.to_csv(csv_path, index=False, encoding="utf-8")
+    
+    # Generate markdown report
+    md_path = os.path.join(OUTPUT_DIR, "report_audio_accel.md")
+    generate_markdown_report(df, md_path)
+    
     print(f"已输出: {csv_path}")
-    print("建议后续：用 diff_* 指标做阈值选择与判定。")
+    print(f"已输出: {md_path}")
+    print("建议后续：用 diff_* 指标做阈值选择与判定，运行 accel_detailed_word_report.py 生成详细报告。")
+
+def generate_markdown_report(df: pd.DataFrame, output_path: str):
+    """Generate markdown report with acceleration analysis"""
+    lines = [
+        "# 音频 + 加速度插接分析报告",
+        "",
+        f"## 总览",
+        f"- 分析文件数: {len(df)}",
+        f"- 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        ""
+    ]
+    
+    # Check for acceleration data
+    accel_cols = [c for c in df.columns if c.startswith('ev_acc_') or c.startswith('cohen_d')]
+    has_accel = len(accel_cols) > 0
+    
+    if has_accel:
+        lines.extend([
+            "## 加速度特征统计",
+            ""
+        ])
+        
+        # Top files by composite score
+        if 'accel_event_score' in df.columns:
+            top_scores = df.nlargest(5, 'accel_event_score')[['file', 'accel_event_score']]
+            lines.extend([
+                "### 复合评分最高的文件:",
+                ""
+            ])
+            for _, row in top_scores.iterrows():
+                lines.append(f"- {row['file']}: {row['accel_event_score']:.3f}")
+            lines.append("")
+        
+        # Effect size summary
+        effect_cols = [c for c in df.columns if c.startswith('cohen_d_')]
+        if effect_cols:
+            lines.extend([
+                "### 效应量统计 (Cohen's d):",
+                ""
+            ])
+            for col in effect_cols:
+                if col in df.columns:
+                    mean_effect = df[col].mean()
+                    lines.append(f"- {col}: 平均 = {mean_effect:.3f}")
+            lines.append("")
+    
+    # Audio features summary
+    lines.extend([
+        "## 音频特征统计",
+        ""
+    ])
+    
+    # Key difference features
+    diff_cols = [c for c in df.columns if c.startswith('diff_') and 'acc_' not in c]
+    if diff_cols:
+        lines.extend([
+            "### 主要差异特征 (事件 vs 背景):",
+            ""
+        ])
+        for col in diff_cols[:10]:  # Show top 10
+            if col in df.columns:
+                mean_diff = df[col].mean()
+                lines.append(f"- {col}: 平均差异 = {mean_diff:.3f}")
+        lines.append("")
+    
+    lines.extend([
+        "## 分析说明",
+        "",
+        "- `ev_*`: 事件窗口特征",
+        "- `bg_*`: 背景窗口特征", 
+        "- `diff_*`: 差值特征 (事件 - 背景)",
+        "- `cohen_d_*`: Cohen's d 效应量",
+        "- `p_ttest_*`: t检验 p值",
+        "- `accel_event_score`: 复合加速度事件评分",
+        "",
+        "运行 `python accel_detailed_word_report.py` 生成详细 Word 报告。"
+    ])
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(lines))
 
 if __name__ == "__main__":
     main()
