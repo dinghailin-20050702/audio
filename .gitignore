@@ -1,0 +1,34 @@
+# Analysis output directory
+analysis_out/
+
+# Reports directory (optional - may want to keep reports in repo)
+reports/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.env
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+/tmp/
+
+# Custom config files (keep default config.yaml)
+custom_config.yaml
+temp_config*.yamlanalysis_out/

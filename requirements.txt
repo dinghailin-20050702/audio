@@ -4,3 +4,7 @@ librosa
 soundfile
 matplotlib
 pandas
+pyyaml
+seaborn
+plotly
+jinja2

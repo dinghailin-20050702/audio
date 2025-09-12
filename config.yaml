@@ -1,0 +1,64 @@
+# Audio Analysis Pipeline Configuration
+
+# Input/Output Paths
+search_dirs:
+  - "recordings"
+output_dir: "analysis_out"
+reports_dir: "reports"
+
+# Audio Processing Parameters
+audio:
+  target_sample_rate: 44100
+  highpass_cutoff: 300.0
+  normalize: true
+
+# Event Detection Parameters
+event_detection:
+  pre_window_sec: 0.15
+  post_window_sec: 0.40
+  background_window_sec: 0.5
+  min_event_gap_sec: 0.2
+  peak_zscore_threshold: 3.5
+
+# Feature Extraction
+features:
+  frequency_bands:
+    - [300, 1000]
+    - [1000, 3000]
+    - [3000, 8000]
+  mfcc_coefficients: 13
+  spectral_features:
+    - centroid
+    - bandwidth
+    - rolloff85
+    - rolloff95
+    - flatness
+    - zero_crossing_rate
+
+# Visualization Settings
+visualization:
+  figure_dpi: 140
+  color_scheme: "viridis"
+  font_size: 10
+  plot_types:
+    - individual_spectrograms
+    - feature_correlations
+    - feature_distributions
+    - comparative_analysis
+    - summary_dashboard
+
+# Report Generation
+report:
+  generate_html: true
+  generate_pdf: false
+  include_individual_plots: true
+  include_summary_stats: true
+  include_recommendations: true
+  template: "default"
+
+# Analysis Thresholds (for scoring and classification)
+thresholds:
+  high_frequency_increase: 0.05
+  spectral_centroid_increase: 1000  # Hz
+  spectral_flatness_increase: 0.05
+  suspicious_score_threshold: 0.7
